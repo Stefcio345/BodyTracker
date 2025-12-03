@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>BodyHeatmap Live</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- NOTE: absolute paths -->
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <h1>BodyHeatmap Live</h1>
+      <p>Pose + Face tracking + Age / Emotion</p>
+    </header>
+
+    <main class="app-main">
+      <!-- LEFT: server-side processed MJPEG stream -->
+      <div class="video-wrapper">
+        <!-- NOTE: absolute path -->
+        <img
+          id="video-stream"
+          src="/video_feed"
+          alt="Video stream from backend"
+        />
+      </div>
+
+      <!-- RIGHT: status + client-side analysis controls -->
+      <aside class="sidebar">
+        <h2>Status</h2>
+        <div id="status" class="status-indicator">Connecting...</div>
+        <p class="hint">
+          If you don’t see video, check backend logs &amp; webcam.
+        </p>
+
+        <hr class="sidebar-separator" />
+
+        <h2>Client-side Analysis</h2>
+        <button id="start-analyze" class="btn-primary">
+          Start client-side analysis
+        </button>
+
+        <video
+          id="webcam"
+          autoplay
+          playsinline
+          width="640"
+          height="480"
+          class="webcam-preview"
+        ></video>
+
+        <div id="analysis-status" class="analysis-status">
+          Analysis idle
+        </div>
+
+        <pre id="analysis-output" class="analysis-output">
+<!-- JSON analysis results will appear here -->
+        </pre>
+      </aside>
+    </main>
+
+    <footer class="app-footer">
+      <span>BodyHeatmap demo – FastAPI + OpenCV</span>
+    </footer>
+  </div>
+
+  <!-- NOTE: absolute path -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
