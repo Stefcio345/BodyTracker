@@ -5,20 +5,29 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
+import mediapipe as mp
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
 from .config import (
     VIDEO_WIDTH,
     VIDEO_HEIGHT,
-    mp_pose,
     mp_face,
+    MAX_POSES,
+    POSE_LANDMARKER_MODEL,
+    POSE_LANDMARKER_MODEL_URL,
 )
 from .tracking import FaceTracker, warmup_deepface
-from .pose_utils import extract_landmarks, smooth_landmarks
+from .pose_utils import (
+    extract_multiple_landmarks,
+    smooth_landmarks_batch,
+)
 from .draw_utils import draw_stickman, draw_faces_and_counts
 
 app = FastAPI()
@@ -54,6 +63,74 @@ def index():
 
 tracker = FaceTracker()
 prev_landmarks_stream = None  # smoothing for /video_feed
+pose_landmarker = None
+
+
+def _ensure_pose_model():
+    if POSE_LANDMARKER_MODEL.exists():
+        return
+
+    try:
+        import urllib.request
+
+        print("[INFO] Downloading pose landmarker model...")
+        urllib.request.urlretrieve(str(POSE_LANDMARKER_MODEL_URL), str(POSE_LANDMARKER_MODEL))
+        print(f"[INFO] Model saved to {POSE_LANDMARKER_MODEL}")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to download pose landmarker model: {exc}")
+
+
+def _get_pose_landmarker():
+    global pose_landmarker
+    if pose_landmarker is not None:
+        return pose_landmarker
+
+    _ensure_pose_model()
+
+    base_options = mp_python.BaseOptions(model_asset_path=str(POSE_LANDMARKER_MODEL))
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        num_poses=MAX_POSES,
+        min_pose_detection_confidence=0.6,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.6,
+    )
+    pose_landmarker = vision.PoseLandmarker.create_from_options(options)
+    return pose_landmarker
+
+
+def _match_faces_to_poses(poses, faces):
+    """
+    Naive association between pose landmarks and face boxes using the nose point.
+    Returns a dict[idx -> bbox or None].
+    """
+    assignments = {}
+    if not poses:
+        return assignments
+
+    for idx, lm_set in enumerate(poses):
+        if len(lm_set) == 0:
+            continue
+        nose_x, nose_y, _, nose_ok = lm_set[mp.solutions.pose.PoseLandmark.NOSE.value]
+        if not nose_ok:
+            continue
+
+        best_bbox = None
+        best_dist = float("inf")
+        for face in faces or []:
+            x1, y1, x2, y2 = face.get("bbox", (0, 0, 0, 0))
+            fx = (x1 + x2) / 2
+            fy = (y1 + y2) / 2
+            dist = (nose_x - fx) ** 2 + (nose_y - fy) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best_bbox = (x1, y1, x2, y2)
+
+        if best_bbox is not None:
+            assignments[idx] = best_bbox
+
+    return assignments
 
 
 def gen_frames():
@@ -69,13 +146,9 @@ def gen_frames():
         print("Could not open webcam")
         return
 
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=2,
-        enable_segmentation=False,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.6,
-    ) as pose, mp_face.FaceDetection(
+    pose_detector = _get_pose_landmarker()
+
+    with mp_face.FaceDetection(
         model_selection=0,
         min_detection_confidence=0.5,
     ) as face_detector:
@@ -88,11 +161,13 @@ def gen_frames():
             frame_h, frame_w = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Pose
-            pose_results = pose.process(rgb)
-            raw_landmarks = extract_landmarks(pose_results, frame_w, frame_h)
+            # Pose (multi-person)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            pose_results = pose_detector.detect(mp_image)
+
+            raw_landmarks = extract_multiple_landmarks(pose_results, frame_w, frame_h)
             if raw_landmarks is not None:
-                smoothed = smooth_landmarks(raw_landmarks, prev_landmarks_stream)
+                smoothed = smooth_landmarks_batch(raw_landmarks, prev_landmarks_stream)
                 prev_landmarks_stream = smoothed
             else:
                 smoothed = None
@@ -103,18 +178,11 @@ def gen_frames():
             detections = face_results.detections if face_results.detections else []
             current_faces = tracker.track(frame, detections)
 
-            main_face_bbox = None
-            if current_faces:
-                main_face = max(
-                    current_faces,
-                    key=lambda f: (f["bbox"][2] - f["bbox"][0])
-                                  * (f["bbox"][3] - f["bbox"][1])
-                )
-                main_face_bbox = main_face["bbox"]
-
-            # Stickman
+            # Stickmen for each pose
             if smoothed is not None:
-                draw_stickman(frame, smoothed, face_bbox=main_face_bbox)
+                face_by_pose = _match_faces_to_poses(smoothed, current_faces)
+                for idx, lm_set in enumerate(smoothed):
+                    draw_stickman(frame, lm_set, face_bbox=face_by_pose.get(idx))
 
             # Mirror + draw faces/counts
             frame_flipped = cv2.flip(frame, 1)
@@ -255,30 +323,25 @@ def analyze(req: AnalyzeRequest):
     frame_h, frame_w = frame.shape[:2]
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    # On-demand models (simple but a bit heavy; can be optimized later)
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=2,
-        enable_segmentation=False,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.6,
-    ) as pose, mp_face.FaceDetection(
+    # Pose
+    pose_detector = _get_pose_landmarker()
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    pose_results = pose_detector.detect(mp_image)
+
+    raw_landmarks = extract_multiple_landmarks(pose_results, frame_w, frame_h)
+
+    if raw_landmarks is not None:
+        smoothed = smooth_landmarks_batch(raw_landmarks, prev_landmarks_http)
+        prev_landmarks_http = smoothed
+    else:
+        smoothed = None
+        prev_landmarks_http = None
+
+    # Faces + tracking
+    with mp_face.FaceDetection(
         model_selection=0,
         min_detection_confidence=0.5,
     ) as face_detector:
-
-        # Pose
-        pose_results = pose.process(rgb)
-        raw_landmarks = extract_landmarks(pose_results, frame_w, frame_h)
-
-        if raw_landmarks is not None:
-            smoothed = smooth_landmarks(raw_landmarks, prev_landmarks_http)
-            prev_landmarks_http = smoothed
-        else:
-            smoothed = None
-            prev_landmarks_http = None
-
-        # Faces + tracking
         face_results = face_detector.process(rgb)
         detections = face_results.detections if face_results.detections else []
         # We don't need the drawn frame here, just tracker info
