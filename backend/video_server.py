@@ -64,7 +64,6 @@ def index():
 tracker = FaceTracker()
 prev_landmarks_stream = None  # smoothing for /video_feed
 pose_landmarker = None
-pose_timestamp_http = 0
 
 
 def _ensure_pose_model():
@@ -91,7 +90,7 @@ def _get_pose_landmarker():
     base_options = mp_python.BaseOptions(model_asset_path=str(POSE_LANDMARKER_MODEL))
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
-        running_mode=vision.RunningMode.VIDEO,
+        running_mode=vision.RunningMode.IMAGE,
         num_poses=MAX_POSES,
         min_pose_detection_confidence=0.6,
         min_pose_presence_confidence=0.5,
@@ -148,7 +147,6 @@ def gen_frames():
         return
 
     pose_detector = _get_pose_landmarker()
-    timestamp_ms = 0
 
     with mp_face.FaceDetection(
         model_selection=0,
@@ -165,8 +163,7 @@ def gen_frames():
 
             # Pose (multi-person)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms += 33  # ~30 FPS pacing for the landmarker
-            pose_results = pose_detector.detect_for_video(mp_image, timestamp_ms)
+            pose_results = pose_detector.detect(mp_image)
 
             raw_landmarks = extract_multiple_landmarks(pose_results, frame_w, frame_h)
             if raw_landmarks is not None:
@@ -328,10 +325,8 @@ def analyze(req: AnalyzeRequest):
 
     # Pose
     pose_detector = _get_pose_landmarker()
-    global pose_timestamp_http
-    pose_timestamp_http += 1
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    pose_results = pose_detector.detect_for_video(mp_image, pose_timestamp_http)
+    pose_results = pose_detector.detect(mp_image)
 
     raw_landmarks = extract_multiple_landmarks(pose_results, frame_w, frame_h)
 
